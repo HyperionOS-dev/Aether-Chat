@@ -1,10 +1,12 @@
 <p align="center"><img src="WhatsAppWeb/Assets.xcassets/AppIcon.appiconset/AppIcon.png" width="96" alt=""></p>
 
-# WhatsApp Web for iOS
+# Aether Chat
 
 Use a second WhatsApp or WhatsApp Business account on your iPhone, as a linked device.
 
-iPhone Safari won't open [web.whatsapp.com](https://web.whatsapp.com); it asks you to download the app instead. This app loads the official WhatsApp Web in a native iPhone app and adapts it to the phone.
+iPhone Safari won't open web.whatsapp.com; it asks you to download the app instead. Aether Chat loads the official WhatsApp Web in a native iPhone app and adapts it to the phone.
+
+Part of the Aether family of software. Based on [whatsapp-web-ios](https://github.com/Etelis/whatsapp-web-ios) by Etelis.
 
 ## Features
 
@@ -37,16 +39,29 @@ iPhone Safari won't open [web.whatsapp.com](https://web.whatsapp.com); it asks y
 
 ## Install
 
-Requires Xcode 16 or later, an iPhone on iOS 17 or later, and an Apple ID. With a free account, the app expires after 7 days; with a paid developer account, after a year.
+Requires an iPhone on iOS 17 or later and an Apple ID. With a free account the app expires after 7 days; with a paid developer account, after a year. SideStore can refresh it automatically.
 
-1. Clone the repo and create `Local.xcconfig` (git-ignored):
-   ```
-   DEVELOPMENT_TEAM = ABCDE12345
-   PRODUCT_BUNDLE_IDENTIFIER = com.yourname.whatsappweb
-   APP_DISPLAY_NAME = WA Business   // optional, defaults to "WA Web"
-   ```
-2. Open `WhatsAppWeb.xcodeproj`, select your iPhone and press **Run** (⌘R). Turn on **Developer Mode** on the phone if asked.
-3. On the phone that already has the account, go to **Settings → Linked devices → Link a device** and scan the QR code shown in the app. Or tap **Log in with phone number** in the app and enter the code on that phone.
+No Mac needed. The IPA is built on GitHub:
+
+1. Go to the **Actions** tab, choose **Build IPA**, and press **Run workflow**.
+2. When the run turns green, open the **Releases** page and download `WhatsAppWeb.ipa`.
+3. Open SideStore, go to **My Apps**, tap **+**, and pick the IPA. SideStore signs it with your Apple ID and installs it.
+4. If the app won't open, trust your Apple ID under **Settings → General → VPN & Device Management**, and make sure **Developer Mode** is on.
+5. On the phone that already has the account, go to **Settings → Linked devices → Link a device** and scan the QR code shown in the app. Or tap **Log in with phone number** in the app and enter the code on that phone.
+
+The app name on the home screen is set by `APP_DISPLAY_NAME` in the workflow file (`.github/workflows/build.yml`).
+
+### Building with Xcode instead
+
+Requires Xcode 16 or later. Create `Local.xcconfig` (git-ignored):
+
+```
+DEVELOPMENT_TEAM = ABCDE12345
+PRODUCT_BUNDLE_IDENTIFIER = com.yourname.aetherchat
+APP_DISPLAY_NAME = Aether Chat
+```
+
+Open `WhatsAppWeb.xcodeproj`, select your iPhone and press **Run** (⌘R).
 
 ## Use
 
@@ -65,4 +80,4 @@ Not affiliated with WhatsApp or Meta. The app only displays the official web.wha
 
 ## License
 
-[MIT](LICENSE)
+MIT. See `LICENSE`. Original work by Etelis.
