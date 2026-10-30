@@ -15,8 +15,8 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
           mkdir Payload
           cp -R build/Build/Products/Release-iphoneos/*.app Payload/
-          zip -r WhatsAppWeb.ipa Payload
+          zip -r AetherChat.ipa Payload
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          files: WhatsAppWeb.ipa
+          tag_name: v1.1
+          files: AetherChat.ipa

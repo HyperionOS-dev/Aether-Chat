@@ -44,7 +44,7 @@ Requires an iPhone on iOS 17 or later and an Apple ID. With a free account the a
 No Mac needed. The IPA is built on GitHub:
 
 1. Go to the **Actions** tab, choose **Build IPA**, and press **Run workflow**.
-2. When the run turns green, open the **Releases** page and download `WhatsAppWeb.ipa`.
+2. When the run turns green, open the **Releases** page and download `AetherChat.ipa`.
 3. Open SideStore, go to **My Apps**, tap **+**, and pick the IPA. SideStore signs it with your Apple ID and installs it.
 4. If the app won't open, trust your Apple ID under **Settings → General → VPN & Device Management**, and make sure **Developer Mode** is on.
 5. On the phone that already has the account, go to **Settings → Linked devices → Link a device** and scan the QR code shown in the app. Or tap **Log in with phone number** in the app and enter the code on that phone.

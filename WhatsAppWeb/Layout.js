@@ -70,12 +70,15 @@
     '#wam-back:dir(rtl) svg{transform:scaleX(-1)}',
   ].join('\n');
 
+  var styleEl = null; // cached so the common case is one property check, not a DOM lookup
   function injectCSS() {
-    if (document.getElementById('wam-style')) return;
-    var s = document.createElement('style');
-    s.id = 'wam-style';
-    s.textContent = CSS;
-    (document.head || html).appendChild(s);
+    if (styleEl && styleEl.isConnected) return;
+    styleEl = document.getElementById('wam-style');
+    if (styleEl) return;
+    styleEl = document.createElement('style');
+    styleEl.id = 'wam-style';
+    styleEl.textContent = CSS;
+    (document.head || html).appendChild(styleEl);
   }
 
   /* ------------------------------------------------------------- viewport */
@@ -207,14 +210,32 @@
     var hdr = d && d.main && d.main.querySelector(':scope > header');
     if (btn && hdr) {
       var r = hdr.getBoundingClientRect();
-      if (r.height) btn.style.top = Math.round(r.top + (r.height - 40) / 2) + 'px';
+      if (r.height) {
+        // Only write when it changed: an unchanged style write still dirties layout for the next read.
+        var top = Math.round(r.top + (r.height - 40) / 2) + 'px';
+        if (btn.style.top !== top) btn.style.top = top;
+      }
     }
   }
 
   // Tells native whether a chat is shown (enables the edge-swipe back gesture) and the text direction.
+  // getComputedStyle forces a style recalc, and direction practically never changes, so only
+  // look it up again when the attributes that control it change (or body first appears).
+  var rtlKey = null, rtlVal = false;
+  function isRtl() {
+    var b = document.body;
+    var key = (html.getAttribute('dir') || '') + '|' + (b ? b.getAttribute('dir') || '' : '#nobody') +
+      '|' + (html.getAttribute('lang') || '');
+    if (key !== rtlKey) {
+      rtlKey = key;
+      rtlVal = getComputedStyle(b || html).direction === 'rtl';
+    }
+    return rtlVal;
+  }
+
   function notifyNative() {
     var msg = { type: 'layout', inChat: html.classList.contains('wam-on') && st.page === 2,
-      rtl: getComputedStyle(document.body || html).direction === 'rtl' };
+      rtl: isRtl() };
     var key = JSON.stringify(msg);
     if (key === st.sent) return;
     st.sent = key;
@@ -222,13 +243,17 @@
   }
 
   var instantNext = true;
+  var lastW = 0;
   function update() {
     fixViewport();
     injectCSS();
     if (mode !== 'mobile') { html.classList.remove('wam-on'); notifyNative(); return; }
     var d = discover();
     if (!d) { html.classList.remove('wam-on', 'wam-page2', 'wam-rdrawer'); st.root = null; notifyNative(); return; }
-    html.style.setProperty('--wam-w', html.clientWidth + 'px');
+    // Only touch the custom property when the width really changed (rotation/resize): every write
+    // invalidates all the carousel rules that use var(--wam-w) and dirties layout for the reads below.
+    var w = html.clientWidth;
+    if (w !== lastW) { lastW = w; html.style.setProperty('--wam-w', w + 'px'); }
     html.classList.add('wam-on');
     var rdrawer = d.root.classList.contains('three');
     if (st.forcePage2) {
@@ -382,13 +407,21 @@
   document.addEventListener('DOMContentLoaded', function () { fixViewport(); vpDone = true; schedule(); });
 
   // Keep the carousel aligned if something (focus, scrollIntoView) scrolls the container.
-  var driftTimer = 0;
+  // Debounced like before (fires 200 ms after the last scroll event), but without creating and
+  // clearing a timer on every event of a fling: one timer re-arms itself only if scrolling continued.
+  var driftTimer = 0, lastDriftEvt = 0;
+  function driftCheck() {
+    driftTimer = 0;
+    var idle = Date.now() - lastDriftEvt;
+    if (idle < 200) { driftTimer = setTimeout(driftCheck, 200 - idle); return; }
+    if (Date.now() >= st.animUntil) { instantNext = true; schedule(); }
+  }
   document.addEventListener('scroll', function (e) {
     if (e.target !== st.scroller) lastScrollAt = Date.now();
     if (!st.scroller || e.target !== st.scroller) return;
-    clearTimeout(driftTimer);
-    driftTimer = setTimeout(function () { if (Date.now() >= st.animUntil) { instantNext = true; schedule(); } }, 200);
-  }, true);
+    lastDriftEvt = Date.now();
+    if (!driftTimer) driftTimer = setTimeout(driftCheck, 200);
+  }, { capture: true, passive: true });
 
   window.__wam = {
     back: back,

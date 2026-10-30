@@ -76,8 +76,12 @@
 
   // ---- Login detection -----------------------------------------------------------
   // (The unread badge is read natively from the page title, which keeps working when JS is throttled.)
-  setInterval(function () {
-    if (!loggedIn && document.getElementById('side')) { loggedIn = true; post({ type: 'loggedIn' }); }
+  // Stops itself after the first detection; loggedIn was never reset before either, so behavior is the same.
+  var loginTimer = setInterval(function () {
+    if (!document.getElementById('side')) return;
+    clearInterval(loginTimer);
+    loggedIn = true;
+    post({ type: 'loggedIn' });
   }, 2000);
 
   // ---- Colors behind the status bar / home indicator -------------------------------
