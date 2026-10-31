@@ -13,7 +13,7 @@ Part of the Aether family of software. Based on [whatsapp-web-ios](https://githu
 - Log in with the QR code or with an 8-character code sent to your phone number
 - Phone layout: chat list and conversation as separate screens, with a back button and edge swipe
 - One tap opens a chat; long-press opens WhatsApp's menu (reply, forward, delete…)
-- iOS notifications, also in the background; tapping one opens the chat; unread count on the app icon
+- iOS notifications, also in the background; one stack per chat, with the contact's photo, and the message only sounds when you are not already reading that chat; unread count on the app icon
 - Voice notes, camera, photos/files, downloads via the share sheet
 - `wa.me` links open the chat in this account
 - Stays logged in; follows light/dark mode
@@ -27,14 +27,15 @@ Part of the Aether family of software. Based on [whatsapp-web-ios](https://githu
 | The desktop layout is at least 748px wide | `Layout.js` shows two phone-width pages: chat list and chat |
 | iOS needs two taps on elements with hover styles | Taps are sent as clicks and long-presses as right-clicks |
 | WKWebView has no `Notification` API | `Bridge.js` passes notifications to iOS; `hasFocus()` follows the app state |
-| iOS suspends apps in the background | Inaudible in-page audio keeps the connection open |
+| iOS suspends apps in the background | Inaudible audio keeps the page alive: a silent Web Audio graph where iOS allows it, otherwise a looping silent clip in an `<audio>` element |
+| iOS stops that audio during calls, Siri, or when another app takes the audio session | `Bridge.js` restarts it and reports its real state; the app watches audio interruptions and re-arms it, then falls back to the `<audio>` element if Web Audio cannot run |
 
 | File | Role |
 |---|---|
-| `WebViewController.swift` | Web view setup, navigation, keyboard, badge, lifecycle, shake menu |
-| `Bridge.js` | Notification shim, focus, keep-alive audio, desktop spoofing |
+| `WebViewController.swift` | Web view setup, navigation, keyboard, badge, lifecycle, audio interruptions, keep-alive mode, shake menu |
+| `Bridge.js` | Notification shim (avatars included), which chat is open, focus, keep-alive (Web Audio + audio element) and its heartbeat |
 | `Layout.js` | Phone layout, back navigation, touch handling, login-screen scaling |
-| `NotificationManager.swift` | Local notifications and badge |
+| `NotificationManager.swift` | Local notifications with avatars, grouped per chat, and badge |
 | `DownloadManager.swift` | Saves downloads and shows the share sheet |
 
 ## Install
@@ -57,7 +58,7 @@ Requires Xcode 16 or later. Create `Local.xcconfig` (git-ignored):
 
 ```
 DEVELOPMENT_TEAM = ABCDE12345
-PRODUCT_BUNDLE_IDENTIFIER = com.yourname.aetherchat
+PRODUCT_BUNDLE_IDENTIFIER = com.aether.chat
 APP_DISPLAY_NAME = Aether Chat
 ```
 
@@ -65,13 +66,17 @@ Open `WhatsAppWeb.xcodeproj`, select your iPhone and press **Run** (⌘R).
 
 ## Use
 
-- **Shake** the phone for Reload, the background-connection toggle, and a zoomable desktop layout.
+- **Shake** the phone for Reload, the background-connection toggle, its mode, and a zoomable desktop layout.
 - **Stay connected in background** is on by default; you'll find it under the app's name in the iOS Settings app. It uses more battery. Without it, notifications only arrive while the app is open.
+- **Background mode: Auto** (the default) keeps the connection with a silent Web Audio graph, which shows no player on the lock screen. If iOS won't keep that graph running, the app switches to **Audio element** by itself and remembers it; that mode always works, but iOS shows a player card with the unread count while it runs. Pick either one from the shake menu to override.
+- **Mix with other audio** (Settings app, on by default) keeps music from other apps playing while the connection is held. Turn it off if another app's sound goes quiet.
 
 ## Limitations
 
 - Calls aren't supported; WhatsApp Web doesn't offer them in this browser.
-- The background connection can still drop, for example when another app plays audio or during a phone call.
+- Notifications rely on the app being kept alive, so they stop if you force-quit it.
+- The lock-screen player card disappears only while the Web Audio mode is running; on a device where it cannot, the app falls back to the audio element and the card is back.
+- The connection can still drop, for example when another app takes the audio session; the app re-arms it after interruptions, but a message that arrives during the gap is only picked up when the connection returns.
 - The layout depends on WhatsApp Web's page structure. If an update breaks it, switch to the desktop layout from the shake menu.
 
 ## Disclaimer

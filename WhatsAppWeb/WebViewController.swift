@@ -1,3 +1,4 @@
+import AVFoundation
 import UIKit
 import WebKit
 
@@ -17,6 +18,24 @@ final class WebViewController: UIViewController {
         set { UserDefaults.standard.set(newValue, forKey: "keepAlive") }
     }
 
+    /// How the connection is held open. "Auto" tries Web Audio (which iOS does not turn into a
+    /// lock-screen media card) and Bridge.js/native fall back to the audio element for good when it does
+    /// not run on this device; "Audio element" always shows that card. Toggled from the shake menu.
+    static var keepAliveModeWebAudio: Bool {
+        get { UserDefaults.standard.string(forKey: "keepAliveMode") != "element" }
+        set { UserDefaults.standard.set(newValue ? "auto" : "element", forKey: "keepAliveMode") }
+    }
+
+    /// The mode handed to Bridge.js, resolved from the setting above.
+    static var keepAliveMode: String { keepAliveModeWebAudio ? "webaudio" : "element" }
+
+    /// Mix the inaudible keep-alive audio with other apps' audio instead of taking the audio session.
+    /// On by default; the toggle lives in the app's section of the Settings app.
+    static var mixAudio: Bool {
+        get { UserDefaults.standard.object(forKey: "mixAudio") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "mixAudio") }
+    }
+
     private var webView: WKWebView!
     private var webViewBottom: NSLayoutConstraint!
     private let bottomFill = UIView()
@@ -26,6 +45,11 @@ final class WebViewController: UIViewController {
     private var titleObservation: NSKeyValueObservation?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var lastBadge = -1
+    /// Chat title the page reports as open on screen ("" in the chat list); silences its notifications.
+    private var openChatTitle = ""
+    /// Last time the page confirmed it is still alive in the background (see the heartbeat watchdog).
+    private var lastHeartbeat = Date.distantPast
+    private var heartbeatTimer: Timer?
 
     override func loadView() {
         let config = WKWebViewConfiguration()
@@ -87,6 +111,7 @@ final class WebViewController: UIViewController {
         NotificationManager.shared.onTap = { [weak self] jsId in
             self?.webView.callAsyncJavaScript("window.__dw?.notificationClicked(id)", arguments: ["id": jsId], in: nil, in: .page)
         }
+        NotificationManager.shared.openChatTitle = { [weak self] in self?.openChatTitle ?? "" }
         titleObservation = webView.observe(\.title) { [weak self] webView, _ in
             DispatchQueue.main.async { self?.updateBadge(fromTitle: webView.title) }
         }
@@ -102,6 +127,10 @@ final class WebViewController: UIViewController {
         nc.addObserver(self, selector: #selector(appWillResignActive), name: UIApplication.willResignActiveNotification, object: nil)
         nc.addObserver(self, selector: #selector(appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
         nc.addObserver(self, selector: #selector(appDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+        // A call, Siri or another app taking the audio session stops the silent keep-alive, and nothing
+        // restarted it before. iOS tells us when the interruption is over: that is the moment to re-arm.
+        nc.addObserver(self, selector: #selector(audioSessionInterrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
+        nc.addObserver(self, selector: #selector(audioServicesWereReset), name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
         reload()
     }
 
@@ -133,17 +162,19 @@ final class WebViewController: UIViewController {
 
     @objc private func appWillResignActive() {
         // Start the keep-alive while the page is still visible; WebKit may refuse to start playback later.
-        if Self.keepAliveEnabled { webView.evaluateJavaScript("window.__dw && window.__dw.keepAlive(true)") }
+        armKeepAlive()
     }
 
     @objc private func appDidEnterBackground() {
         // WhatsApp only notifies while the page reports no focus.
         webView.evaluateJavaScript("window.__dw && window.__dw.setAppActive(false)")
         beginBackgroundTask()
+        startHeartbeatWatchdog()
     }
 
     @objc private func appDidBecomeActive() {
         endBackgroundTask()
+        stopHeartbeatWatchdog()
         webView.evaluateJavaScript("window.__dw && (window.__dw.setAppActive(true), window.__dw.keepAlive(false))")
         refreshBadge() // notification permission may have changed in Settings
     }
@@ -151,7 +182,88 @@ final class WebViewController: UIViewController {
     /// A new document (e.g. a reload while in the background) starts out focused and silent; re-apply background state.
     private func pageReady() {
         guard UIApplication.shared.applicationState == .background else { return }
-        webView.evaluateJavaScript("window.__dw.setAppActive(false)" + (Self.keepAliveEnabled ? "; window.__dw.keepAlive(true)" : ""))
+        webView.evaluateJavaScript("window.__dw.setAppActive(false)")
+        armKeepAlive()
+    }
+
+    // MARK: - Background keep-alive
+
+    /// Tells the page to hold the connection open in the mode iOS has accepted so far.
+    private func armKeepAlive() {
+        guard Self.keepAliveEnabled else { return }
+        applyAudioSession()
+        lastHeartbeat = Date()
+        webView.evaluateJavaScript("window.__dw && window.__dw.keepAlive(true, '\(Self.keepAliveMode)')")
+    }
+
+    /// The keep-alive plays inaudible audio, which needs an active audio session. Mixing with other apps
+    /// is the default so music keeps playing; WebKit manages its own session for the web content, so this
+    /// is best effort and never fatal.
+    private func applyAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        let options: AVAudioSession.CategoryOptions = Self.mixAudio ? [.mixWithOthers] : []
+        try? session.setCategory(.playback, mode: .default, options: options)
+        try? session.setActive(true)
+    }
+
+    /// A Web Audio graph that is not running (iOS refused it without a tap, or this WebKit has no Audio
+    /// Session API) means no keep-alive at all, so the audio element takes over for good. The choice is
+    /// remembered, and the shake menu can set it back to Auto.
+    private func keepAliveStateChanged(_ body: [String: Any]) {
+        let mode = body["mode"] as? String ?? ""
+        let state = body["state"] as? String ?? ""
+        guard mode == "webaudio", state != "running", Self.keepAliveModeWebAudio, Self.keepAliveEnabled else { return }
+        Self.keepAliveModeWebAudio = false
+        armKeepAlive()
+    }
+
+    /// While the app is in the background the page beats every 20 s. Beats stopping means the Web Audio
+    /// graph was suspended (a call, another app, iOS reclaiming the session) and the page is frozen with
+    /// it, so nothing would arrive: switch to the audio element, which iOS keeps running.
+    private func startHeartbeatWatchdog() {
+        stopHeartbeatWatchdog()
+        lastHeartbeat = Date()
+        let timer = Timer(timeInterval: 20, repeats: true) { [weak self] _ in self?.heartbeatWatched() }
+        RunLoop.main.add(timer, forMode: .common)
+        heartbeatTimer = timer
+    }
+
+    private func stopHeartbeatWatchdog() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+
+    private func heartbeatWatched() {
+        guard Self.keepAliveEnabled, Self.keepAliveModeWebAudio,
+              UIApplication.shared.applicationState != .active,
+              Date().timeIntervalSince(lastHeartbeat) > 60 else { return }
+        lastHeartbeat = Date()
+        Self.keepAliveModeWebAudio = false
+        armKeepAlive()
+    }
+
+    /// iOS ends an interruption (phone call, Siri, another app) with permission to resume; before this,
+    /// the silent loop stayed paused until the app was reopened.
+    @objc private func audioSessionInterrupted(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .ended:
+            // iOS only ends the notification when playback may continue, so always try to start again.
+            rearmKeepAliveIfBackgrounded()
+        default:
+            break // .began: nothing to do until iOS allows playback again
+        }
+    }
+
+    /// The media services restart (rare) loses every audio session; start the keep-alive again.
+    @objc private func audioServicesWereReset() {
+        rearmKeepAliveIfBackgrounded()
+    }
+
+    private func rearmKeepAliveIfBackgrounded() {
+        guard Self.keepAliveEnabled, UIApplication.shared.applicationState != .active else { return }
+        armKeepAlive()
     }
 
     /// Grace period for messages arriving right after leaving the app (the only one without keep-alive).
@@ -222,6 +334,11 @@ final class WebViewController: UIViewController {
         let keep = Self.keepAliveEnabled
         sheet.addAction(UIAlertAction(title: keep ? "Background connection: On ✓" : "Background connection: Off",
                                       style: .default) { [weak self] _ in self?.setKeepAlive(!keep) })
+        let webAudio = Self.keepAliveModeWebAudio
+        sheet.addAction(UIAlertAction(title: webAudio ? "Background mode: Auto ✓" : "Background mode: Auto",
+                                      style: .default) { _ in Self.keepAliveModeWebAudio = true })
+        sheet.addAction(UIAlertAction(title: webAudio ? "Background mode: Audio element" : "Background mode: Audio element ✓",
+                                      style: .default) { _ in Self.keepAliveModeWebAudio = false })
         sheet.addAction(UIAlertAction(title: desktopLayout ? "Use phone layout" : "Use desktop layout (zoomable)",
                                       style: .default) { [weak self] _ in
             self?.webView.evaluateJavaScript("window.__wam && window.__wam.setMode('\(desktopLayout ? "mobile" : "desktop")')")
@@ -238,7 +355,7 @@ final class WebViewController: UIViewController {
         guard on else { Self.keepAliveEnabled = false; return }
         let alert = UIAlertController(
             title: "Stay connected in background?",
-            message: "Keeps WhatsApp connected after you leave the app so new messages still notify you. It plays inaudible audio to stay awake, which uses more battery.",
+            message: "Keeps WhatsApp connected after you leave the app so new messages still notify you. It plays inaudible audio to stay awake, which uses more battery. It mixes with other apps' audio by default (Settings ▸ Mix with other audio).",
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Turn On", style: .default) { _ in Self.keepAliveEnabled = true })
@@ -289,9 +406,16 @@ extension WebViewController: WKScriptMessageHandler {
             NotificationManager.shared.post(id: body["id"] as? String ?? UUID().uuidString,
                                             title: body["title"] as? String ?? "WhatsApp",
                                             body: body["body"] as? String ?? "",
-                                            tag: body["tag"] as? String)
+                                            tag: body["tag"] as? String,
+                                            icon: body["icon"] as? String)
         case "closeNotification":
             if let tag = body["tag"] as? String { NotificationManager.shared.close(tag: tag) }
+        case "openChat":
+            openChatTitle = body["title"] as? String ?? ""
+        case "keepAlive":
+            keepAliveStateChanged(body)
+        case "keepBeat":
+            lastHeartbeat = Date()
         case "ready":
             pageReady()
         case "loggedIn":

@@ -12,7 +12,7 @@
 			<key>Title</key>
 			<string>Notifications</string>
 			<key>FooterText</key>
-			<string>Keeps WhatsApp connected after you leave the app so new messages still notify you. Plays inaudible audio to stay awake, which uses more battery and may pause music from other apps. Tip: shake the phone inside the app for more options.</string>
+			<string>Keeps WhatsApp connected after you leave the app so new messages still notify you. It plays inaudible audio to stay awake, which uses more battery. Audio is mixed with other apps by default, so music keeps playing; if another app's sound still stops, turn mixing off. Tip: shake the phone inside the app for more options.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
@@ -21,6 +21,16 @@
 			<string>Stay connected in background</string>
 			<key>Key</key>
 			<string>keepAlive</string>
+			<key>DefaultValue</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+			<key>Title</key>
+			<string>Mix with other audio</string>
+			<key>Key</key>
+			<string>mixAudio</string>
 			<key>DefaultValue</key>
 			<true/>
 		</dict>
