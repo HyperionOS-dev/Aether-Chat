@@ -18,5 +18,5 @@ jobs:
           zip -r AetherChat.ipa Payload
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.2
+          tag_name: v1.3
           files: AetherChat.ipa

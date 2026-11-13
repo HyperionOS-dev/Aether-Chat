@@ -38,6 +38,20 @@ Part of the Aether family of software. Based on [whatsapp-web-ios](https://githu
 | `NotificationManager.swift` | Local notifications with avatars, grouped per chat, and badge |
 | `DownloadManager.swift` | Saves downloads and shows the share sheet |
 
+## Performance (Turbo mode)
+
+On by default. Turn it off in the shake menu or under the app's name in the Settings app.
+
+- The page renders without `backdrop-filter` blur, shadows and animations. Blur is recomputed for everything behind the header, composer and drawers on every scroll frame, which is one of the most expensive things a web page can ask a phone GPU to do.
+- Offscreen videos are paused and offscreen images decode lazily, so a long conversation stops costing frames once you scroll away from it.
+- Animated stickers are frozen to the frame that is showing: an animation in an `<img>` decodes a new frame for as long as it is on screen, which in a sticker-heavy chat is a permanent CPU and battery cost. Only media whose own header declares an animation is touched, so photos and thumbnails are left exactly as they are.
+- The nav-rail entries for Status, Channels and Communities are removed, so WhatsApp Web never loads their code or their media.
+- Launching: the web content process is started while the UI is still coming up, and the last frame of the last session covers the page while it loads, so the app opens on your chat list instead of a white screen.
+- The app's own scripts stopped polling. Page colors and the open chat are recomputed on a debounce when the page actually changes instead of on timers, and the carousel geometry only re-measures when the page or the width changed, not on every DOM change WhatsApp makes.
+- **Shake → Measure performance** reports frames per second, hitches, long tasks, main-thread stalls, memory and the time from launch to the chat list, so any change can be judged with numbers instead of a feeling.
+
+What this cannot fix: WhatsApp's own code still runs inside the web view. Rendering each message, decrypting, syncing and the React tree are Meta's, and no shell around it can remove that cost — the ceiling of this approach is a leaner frame around the same client.
+
 ## Install
 
 Requires an iPhone on iOS 17 or later and an Apple ID. With a free account the app expires after 7 days; with a paid developer account, after a year. SideStore can refresh it automatically.

@@ -120,7 +120,9 @@
   }, 2000);
 
   // ---- Colors behind the status bar / home indicator -------------------------------
-  // Native paints the strips above and below the web view with the page's edge colors.
+  // Native paints the strips above and below the web view with the page's edge colors. Element hit testing
+  // and getComputedStyle both force style recalc, so this is no longer a 1 s timer: Layout.js calls
+  // refreshEdges() on a debounce when something actually changed, and resize/visibility cover the rest.
   function bgAt(x, y) {
     var el = document.elementFromPoint(x, y);
     for (; el && el !== document.documentElement; el = el.parentElement) {
@@ -130,11 +132,15 @@
     return getComputedStyle(document.body || document.documentElement).backgroundColor;
   }
   var lastEdges = '';
-  setInterval(function () {
+  function refreshEdges() {
     if (!document.body || document.hidden) return;
     var top = bgAt(window.innerWidth / 2, 2), bottom = bgAt(window.innerWidth / 2, window.innerHeight - 2);
     if (top + bottom !== lastEdges) { lastEdges = top + bottom; post({ type: 'edges', top: top, bottom: bottom }); }
-  }, 1000);
+  }
+  window.addEventListener('resize', function () { setTimeout(refreshEdges, 300); }, { passive: true });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) setTimeout(refreshEdges, 300);
+  }, { passive: true });
 
   // ---- Focus ------------------------------------------------------------------------
   // WhatsApp never shows a notification while document.hasFocus() is true, and uses focus for
@@ -167,12 +173,14 @@
     }
     return name;
   }
-  setInterval(function () {
+  // Called by Layout.js on the same debounce as the edge colors (it already knows when the page changed),
+  // instead of a 2 s poll that ran querySelectors forever.
+  function refreshOpenChat() {
     var name = currentChatTitle();
     if (name === openChat) return;
     openChat = name;
     post({ type: 'openChat', title: name });
-  }, 2000);
+  }
 
   // ---- Background keep-alive (opt-in) ----------------------------------------------
   // WebKit keeps a page's process at foreground priority while it is playing audio, so something has to
@@ -342,17 +350,151 @@
     }
   }, 5000);
 
+  // ---- Turbo: media the page is not looking at ----------------------------------------
+  // Offscreen videos and stickers keep decoding and animating (CPU, GPU, battery) with nobody watching, and
+  // every new message adds more of them. Only elements well outside the viewport are touched, and a video
+  // the page started is resumed when it scrolls back in. Off by default for old messages already on screen.
+  function turboMedia() {
+    function turboOn() { return document.documentElement.classList.contains('wam-turbo'); }
+    var io = null;
+    try {
+      io = new IntersectionObserver(function (entries) {
+        for (var i = 0; i < entries.length; i++) {
+          var v = entries[i].target;
+          if (v.tagName !== 'VIDEO') continue;
+          if (entries[i].isIntersecting) {
+            if (v.__dwPaused) {
+              v.__dwPaused = false;
+              try { var p = v.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+            }
+          } else if (!v.paused) {
+            v.__dwPaused = true;
+            try { v.pause(); } catch (e) {}
+          }
+        }
+      }, { rootMargin: '300px 0px' });
+    } catch (e) { return; }
+    function consider(el) {
+      if (!el || el.nodeType !== 1 || el.__dwMedia) return;
+      if (el.tagName === 'VIDEO') {
+        el.__dwMedia = true;
+        if (!el.hasAttribute('preload')) el.setAttribute('preload', 'none');   // no speculative download
+        try { io.observe(el); } catch (e) {}
+      } else if (el.tagName === 'IMG') {
+        el.__dwMedia = true;
+        if (el.decoding !== 'async') el.decoding = 'async';                    // decode off the main thread
+        if (!el.hasAttribute('loading')) el.setAttribute('loading', 'lazy');   // offscreen images wait
+        considerFreeze(el);
+      }
+    }
+
+    // Stickers are animated WebP images, and an <img> decodes a new frame for as long as it is on screen, so a
+    // chat full of them is a permanent CPU and battery cost. Only genuinely animated media is touched: the
+    // blob header says so (an animated WebP carries an ANIM chunk), which keeps photos and thumbnails
+    // completely untouched. A tainted canvas means a remote image, and that one is left alone too.
+    var frozen = 0;
+    function freeze(img) {
+      if (frozen++ >= 200) return;
+      try {
+        var canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        canvas.getContext('2d').drawImage(img, 0, 0);
+        var still = canvas.toDataURL('image/webp', 0.92);
+        if (still && still.length > 32) { img.srcset = ''; img.src = still; }
+      } catch (e) {}   // tainted canvas: the image stays as it is
+    }
+    function considerFreeze(img) {
+      if (frozen >= 200 || !turboOn()) return;
+      // Only the conversation: the chat list never shows stickers, so there is nothing to walk there.
+      var main = document.getElementById('main');
+      if (!main || !main.contains(img)) return;
+      var src = img.getAttribute('src') || '';
+      if (!/^blob:/i.test(src)) return;             // decrypted in the page; a remote URL cannot be read back
+      if (!img.complete || !img.naturalWidth) {
+        img.addEventListener('load', function () { considerFreeze(img); }, { once: true });
+        return;
+      }
+      if (img.naturalWidth > 512 || img.naturalHeight > 512) return;   // stickers and icons, not photos
+      try {
+        fetch(src).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+          var bytes = new Uint8Array(buf, 0, Math.min(buf.byteLength, 64)), head = '';
+          for (var i = 0; i < bytes.length; i++) head += String.fromCharCode(bytes[i]);
+          if (head.indexOf('ANIM') >= 0) freeze(img);
+        }).catch(function () {});
+      } catch (e) {}
+    }
+    function scan(node) {
+      if (!node || node.nodeType !== 1) return;
+      consider(node);
+      var found = node.querySelectorAll ? node.querySelectorAll('video, img') : [];
+      for (var i = 0; i < found.length; i++) consider(found[i]);
+    }
+    scan(document.body);
+    try {
+      // Only walks what was added, so it stays cheap even while WhatsApp churns through messages.
+      new MutationObserver(function (records) {
+        if (!turboOn()) return;
+        for (var i = 0; i < records.length; i++) {
+          var added = records[i].addedNodes;
+          for (var j = 0; j < added.length; j++) scan(added[j]);
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+
+  // ---- Performance sample (shake menu) ------------------------------------------------
+  // What the page itself can see: frames per second, how many frames were slow, and long tasks that blocked
+  // the main thread. Native adds memory, main-thread stalls and the launch-to-chat-list time on top.
+  function measure(ms, done) {
+    var frames = 0, slow = 0, worst = 0, start = 0, last = 0, raf = 0, longTasks = 0, obs = null;
+    try {
+      if (window.PerformanceObserver && PerformanceObserver.supportedEntryTypes &&
+          PerformanceObserver.supportedEntryTypes.indexOf('longtask') >= 0) {
+        obs = new PerformanceObserver(function (list) { longTasks += list.getEntries().length; });
+        obs.observe({ entryTypes: ['longtask'] });
+      }
+    } catch (e) { obs = null; }
+    function finish(elapsed) {
+      if (obs) { try { obs.disconnect(); } catch (e) {} }
+      done({ fps: elapsed > 0 ? Math.round(frames * 1000 / elapsed) : 0, frames: frames,
+             slowFrames: slow, worstFrameMs: Math.round(worst), longTasks: longTasks });
+    }
+    function step(t) {
+      if (!start) { start = last = t; }
+      var d = t - last;
+      last = t;
+      frames++;
+      if (d > 32) slow++;      // longer than two 60 Hz refreshes: a visible hitch
+      if (d > worst) worst = d;
+      if (t - start < ms) raf = requestAnimationFrame(step);
+      else finish(t - start);
+    }
+    raf = requestAnimationFrame(step);
+  }
+
   // ---- API used from Swift --------------------------------------------------------
   window.__dw = {
     setAppActive: setAppActive,
     keepAlive: keepAlive,
     keepAliveState: function () { return { mode: keepMode, state: keepState() }; },
+    refreshEdges: refreshEdges,
+    refreshOpenChat: refreshOpenChat,
+    measure: function (ms) {
+      measure(ms || 3000, function (result) {
+        result.type = 'perf';
+        result.turbo = document.documentElement.classList.contains('wam-turbo');
+        post(result);
+      });
+    },
     notificationClicked: function (id) {
       var n = live[id];
       window.focus();
       if (n) n._fire('click');
     }
   };
+  turboMedia();
+
   // Every new document (including reloads while in the background) asks native for the app state.
   post({ type: 'ready' });
 })();

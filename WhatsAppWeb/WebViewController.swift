@@ -36,6 +36,13 @@ final class WebViewController: UIViewController {
         set { UserDefaults.standard.set(newValue, forKey: "mixAudio") }
     }
 
+    /// Turbo mode: the page renders without backdrop blur, shadows and animations (Settings app and shake
+    /// menu). On by default — blur is one of the most expensive things on a phone GPU and buys nothing.
+    static var turbo: Bool {
+        get { UserDefaults.standard.object(forKey: "turbo") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "turbo") }
+    }
+
     private var webView: WKWebView!
     private var webViewBottom: NSLayoutConstraint!
     private let bottomFill = UIView()
@@ -50,6 +57,19 @@ final class WebViewController: UIViewController {
     /// Last time the page confirmed it is still alive in the background (see the heartbeat watchdog).
     private var lastHeartbeat = Date.distantPast
     private var heartbeatTimer: Timer?
+    // Performance report ("Measure performance" in the shake menu): app start, main-thread stalls and how
+    // long it took before the chat list was on screen.
+    private let launchedAt = Date()
+    private var startupSeconds: TimeInterval?
+    private var hangProbe: Timer?
+    private var hangTick: Date?
+    private var hangWorstMs = 0
+    // Launch: a throwaway web view warms the web content process, and the last frame of the last session is
+    // shown until the real page has painted.
+    private var warmUp: WKWebView?
+    private let launchImage = UIImageView()
+    /// Whether the page has accepted the Turbo setting; retried on the first "layout" message if not.
+    private var turboSynced = false
 
     override func loadView() {
         let config = WKWebViewConfiguration()
@@ -90,14 +110,25 @@ final class WebViewController: UIViewController {
         bottomFill.backgroundColor = .systemBackground
         root.addSubview(bottomFill)
         root.addSubview(webView)
+        // Above the web view: the last frame of the last session, so launching does not show a white screen.
+        launchImage.contentMode = .scaleAspectFill
+        launchImage.clipsToBounds = true
+        launchImage.isUserInteractionEnabled = false
+        launchImage.isHidden = true
+        root.addSubview(launchImage)
         bottomFill.translatesAutoresizingMaskIntoConstraints = false
         webView.translatesAutoresizingMaskIntoConstraints = false
+        launchImage.translatesAutoresizingMaskIntoConstraints = false
         webViewBottom = webView.bottomAnchor.constraint(equalTo: root.safeAreaLayoutGuide.bottomAnchor)
         NSLayoutConstraint.activate([
             webView.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor),
             webViewBottom,
             webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            launchImage.topAnchor.constraint(equalTo: root.topAnchor),
+            launchImage.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            launchImage.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            launchImage.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             bottomFill.topAnchor.constraint(equalTo: root.centerYAnchor),
             bottomFill.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             bottomFill.leadingAnchor.constraint(equalTo: root.leadingAnchor),
@@ -131,6 +162,8 @@ final class WebViewController: UIViewController {
         // restarted it before. iOS tells us when the interruption is over: that is the moment to re-arm.
         nc.addObserver(self, selector: #selector(audioSessionInterrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
         nc.addObserver(self, selector: #selector(audioServicesWereReset), name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
+        showLaunchSnapshot()
+        prewarmWebProcess()
         reload()
     }
 
@@ -170,11 +203,13 @@ final class WebViewController: UIViewController {
         webView.evaluateJavaScript("window.__dw && window.__dw.setAppActive(false)")
         beginBackgroundTask()
         startHeartbeatWatchdog()
+        saveLaunchSnapshot()
     }
 
     @objc private func appDidBecomeActive() {
         endBackgroundTask()
         stopHeartbeatWatchdog()
+        applyTurbo() // the Settings app toggle may have changed while we were away
         webView.evaluateJavaScript("window.__dw && (window.__dw.setAppActive(true), window.__dw.keepAlive(false))")
         refreshBadge() // notification permission may have changed in Settings
     }
@@ -339,6 +374,14 @@ final class WebViewController: UIViewController {
                                       style: .default) { _ in Self.keepAliveModeWebAudio = true })
         sheet.addAction(UIAlertAction(title: webAudio ? "Background mode: Audio element" : "Background mode: Audio element ✓",
                                       style: .default) { _ in Self.keepAliveModeWebAudio = false })
+        sheet.addAction(UIAlertAction(title: Self.turbo ? "Turbo mode: On ✓" : "Turbo mode: Off",
+                                      style: .default) { [weak self] _ in
+            Self.turbo = !Self.turbo
+            self?.applyTurbo()
+        })
+        sheet.addAction(UIAlertAction(title: "Measure performance", style: .default) { [weak self] _ in
+            self?.measurePerformance()
+        })
         sheet.addAction(UIAlertAction(title: desktopLayout ? "Use phone layout" : "Use desktop layout (zoomable)",
                                       style: .default) { [weak self] _ in
             self?.webView.evaluateJavaScript("window.__wam && window.__wam.setMode('\(desktopLayout ? "mobile" : "desktop")')")
@@ -360,6 +403,119 @@ final class WebViewController: UIViewController {
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Turn On", style: .default) { _ in Self.keepAliveEnabled = true })
         present(alert, animated: true)
+    }
+
+    // MARK: - Performance
+
+    /// Pushes the Turbo setting into the page; the JS side ignores it when nothing changed. The result says
+    /// whether the page was ready for it: Bridge.js posts its "ready" message before Layout.js has defined
+    /// `__wam`, so a cold start needs the retry from the first "layout" message (see the message switch).
+    private func applyTurbo() {
+        let call = "window.__wam ? (window.__wam.setTurbo(\(Self.turbo ? "true" : "false")), true) : false"
+        webView.evaluateJavaScript(call) { [weak self] result, _ in
+            self?.turboSynced = (result as? Bool) ?? false
+        }
+    }
+
+    private func measurePerformance() {
+        startHangProbe()
+        webView.evaluateJavaScript("window.__dw && window.__dw.measure && window.__dw.measure(3000)")
+    }
+
+    /// A timer that should fire every 250 ms: how late it fires is exactly how long the main thread was
+    /// blocked. Cheap, and it catches the stalls the frame counter cannot see (React re-renders, layout).
+    private func startHangProbe() {
+        stopHangProbe()
+        hangWorstMs = 0
+        hangTick = Date()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self, let previous = self.hangTick else { return }
+            self.hangWorstMs = max(self.hangWorstMs, Int(Date().timeIntervalSince(previous) * 1000))
+            self.hangTick = Date()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hangProbe = timer
+    }
+
+    private func stopHangProbe() {
+        hangProbe?.invalidate()
+        hangProbe = nil
+        hangTick = nil
+    }
+
+    private func showPerfReport(_ body: [String: Any]) {
+        stopHangProbe()
+        var lines = [
+            "Turbo mode: \((body["turbo"] as? Bool ?? false) ? "on" : "off")",
+            "Frames per second (idle): \(body["fps"] as? Int ?? 0)",
+            "Frames over 32 ms: \(body["slowFrames"] as? Int ?? 0) (worst \(body["worstFrameMs"] as? Int ?? 0) ms)",
+            "Long tasks over 50 ms: \(body["longTasks"] as? Int ?? 0)",
+        ]
+        if let mb = Self.memoryFootprintMB() { lines.append(String(format: "Memory: %.0f MB", mb)) }
+        if hangWorstMs > 0 { lines.append("Main thread stalls: up to \(hangWorstMs) ms") }
+        if let startup = startupSeconds { lines.append(String(format: "Launch to chat list: %.1f s", startup)) }
+        let alert = UIAlertController(title: "Performance", message: lines.joined(separator: "\n"), preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+    }
+
+    /// Resident size of the whole app, web content included. `phys_footprint` is the number iOS shows in
+    /// Settings and the one the memory limit is measured against.
+    static func memoryFootprintMB() -> Double? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer -> kern_return_t in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return Double(info.phys_footprint) / 1_048_576
+    }
+
+    // MARK: - Launch
+
+    /// The last frame of the last session, kept in Caches (iOS may purge it, then we simply start white).
+    private static let snapshotURL = FileManager.default
+        .urls(for: .cachesDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("launch.jpg")
+
+    /// Taken while the app is still on screen: backgrounding can detach the view and the snapshot comes back empty.
+    /// At most once a minute, because this is a splash image and every other app switch would otherwise pay
+    /// for a full-screen encode and a multi-megabyte write.
+    private func saveLaunchSnapshot() {
+        guard let url = Self.snapshotURL else { return }
+        let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        if let modified, Date().timeIntervalSince(modified) < 60 { return }
+        webView.takeSnapshot(with: nil) { image, _ in
+            // JPEG rather than PNG: a few hundred KB instead of a few MB, for an image that is hidden again
+            // as soon as the page paints. It is a snapshot of the screen, not an asset.
+            guard let data = image?.jpegData(compressionQuality: 0.7) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Covers the page while it loads, so the app opens on your last screen instead of a white rectangle.
+    private func showLaunchSnapshot() {
+        guard let url = Self.snapshotURL, let image = UIImage(contentsOfFile: url.path) else { return }
+        launchImage.image = image
+        launchImage.isHidden = false
+        // A stale frame must never outlive the real page for long.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.hideLaunchSnapshot() }
+    }
+
+    private func hideLaunchSnapshot() {
+        guard !launchImage.isHidden else { return }
+        launchImage.isHidden = true
+        launchImage.image = nil // a full-screen PNG, no reason to keep the pixels
+    }
+
+    /// Starts the web content process while the UI is still coming up. WebKit shares one process pool per
+    /// app, so the real page's first navigation does not pay for spawning it; this view is then thrown away.
+    private func prewarmWebProcess() {
+        let warm = WKWebView()
+        warm.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        warmUp = warm
     }
 
     // MARK: - Helpers
@@ -416,9 +572,15 @@ extension WebViewController: WKScriptMessageHandler {
             keepAliveStateChanged(body)
         case "keepBeat":
             lastHeartbeat = Date()
+        case "perf":
+            showPerfReport(body)
         case "ready":
+            applyTurbo() // keep the page in sync with the setting after a reload
             pageReady()
         case "loggedIn":
+            if startupSeconds == nil { startupSeconds = Date().timeIntervalSince(launchedAt) }
+            hideLaunchSnapshot() // the chat list is on screen; the snapshot has done its job
+            warmUp = nil         // the real view owns the warm process from here
             // Asked only once logged in, not on the QR screen.
             NotificationManager.shared.requestAuthorization { [weak self] granted in
                 if granted { self?.refreshBadge() }
@@ -427,6 +589,7 @@ extension WebViewController: WKScriptMessageHandler {
             if let top = Self.color(fromCSS: body["top"] as? String) { view.backgroundColor = top }
             if let bottom = Self.color(fromCSS: body["bottom"] as? String) { bottomFill.backgroundColor = bottom }
         case "layout":
+            if !turboSynced { applyTurbo() } // Layout.js posted this, so __wam exists by now
             layoutChanged(body)
         default:
             break

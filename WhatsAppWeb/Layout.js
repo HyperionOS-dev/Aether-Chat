@@ -26,6 +26,23 @@
   var mode = 'mobile';
   try { mode = localStorage.getItem(MODE_KEY) === 'desktop' ? 'desktop' : 'mobile'; } catch (e) {}
 
+  // Turbo mode: no backdrop blur, shadows or animations on the page (see the CSS below). Native owns the
+  // setting; it is mirrored in localStorage so the first paint after a reload already has it, and the class
+  // goes on before any of WhatsApp's own styles are parsed.
+  var TURBO_KEY = 'wam-turbo';
+  var turbo = true;
+  try { turbo = localStorage.getItem(TURBO_KEY) !== 'off'; } catch (e) {}
+  if (turbo) html.classList.add('wam-turbo');
+
+  // Native owns the switch (Settings app and shake menu). Persisted, so a reload paints with it already on.
+  function setTurbo(v) {
+    v = !!v;
+    if (v === turbo) return;
+    turbo = v;
+    html.classList.toggle('wam-turbo', v);
+    try { localStorage.setItem(TURBO_KEY, v ? 'on' : 'off'); } catch (e) {}
+  }
+
   function wantViewport() {
     if (mode === 'desktop') return VIEWPORT.desktop;
     if (document.getElementById('side') || document.getElementById('main')) return VIEWPORT.mobile;
@@ -68,6 +85,19 @@
     '#wam-back:active{background:rgba(127,127,127,.2)}',
     '#wam-back svg{width:24px;height:24px;fill:currentColor}',
     '#wam-back:dir(rtl) svg{transform:scaleX(-1)}',
+
+    // ---- Turbo mode (on by default, shake menu / Settings app) -------------------------
+    // backdrop-filter re-blurs everything behind the header, composer and drawers on every single scroll
+    // frame; on a phone that is one of the most expensive things on the page and it changes nothing about
+    // whether you can read your messages. Shadows and animations are the same story: they cost frames.
+    'html.wam-turbo *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}',
+    'html.wam-turbo *{box-shadow:none!important}',
+    'html.wam-turbo *{animation-duration:1ms!important;animation-delay:0s!important;' +
+      'transition-duration:1ms!important;transition-delay:0s!important}',
+    // Nav-rail entries for features this app never opens. WhatsApp Web only loads their code and media when
+    // you go there, so removing the way in keeps Status videos, Channels and Communities out of memory.
+    'html.wam-turbo [aria-label="Status"],html.wam-turbo [aria-label="Channels"],' +
+      'html.wam-turbo [aria-label="Communities"]{display:none!important}',
   ].join('\n');
 
   var styleEl = null; // cached so the common case is one property check, not a DOM lookup
@@ -244,30 +274,56 @@
 
   var instantNext = true;
   var lastW = 0;
+
+  // Bridge.js keeps the page colors and the open chat in memory; recomputing those needs elementFromPoint
+  // and getComputedStyle (forced style recalc + hit testing), so they are refreshed on a trailing 400 ms
+  // debounce instead of on a timer. At most one refresh per burst, and never while nothing happens.
+  var hostTmo = 0;
+  function notifyHost() {
+    if (hostTmo) return;
+    hostTmo = setTimeout(function () {
+      hostTmo = 0;
+      var dw = window.__dw;
+      if (!dw) return;
+      try { if (dw.refreshEdges) dw.refreshEdges(); } catch (e) {}
+      try { if (dw.refreshOpenChat) dw.refreshOpenChat(); } catch (e) {}
+    }, 400);
+  }
+
   function update() {
     fixViewport();
     injectCSS();
     if (mode !== 'mobile') { html.classList.remove('wam-on'); notifyNative(); return; }
     var d = discover();
     if (!d) { html.classList.remove('wam-on', 'wam-page2', 'wam-rdrawer'); st.root = null; notifyNative(); return; }
+    // window.innerWidth is the viewport size WebKit already tracks; html.clientWidth forces a layout flush,
+    // and this runs for every DOM change WhatsApp makes (new messages, typing, presence, timestamps).
+    var w = window.innerWidth;
+    var widthChanged = w !== lastW;
     // Only touch the custom property when the width really changed (rotation/resize): every write
     // invalidates all the carousel rules that use var(--wam-w) and dirties layout for the reads below.
-    var w = html.clientWidth;
-    if (w !== lastW) { lastW = w; html.style.setProperty('--wam-w', w + 'px'); }
+    if (widthChanged) { lastW = w; html.style.setProperty('--wam-w', w + 'px'); }
     html.classList.add('wam-on');
     var rdrawer = d.root.classList.contains('three');
     if (st.forcePage2) {
       var mid = d.root.querySelector('[data-testid="drawer-middle"]');
       if (d.main || !mid || !mid.firstElementChild) st.forcePage2 = false;
     }
-    if (!d.main && !rdrawer && !st.forcePage2) st.page = 1;
-    else st.page = 2;
-    html.classList.toggle('wam-page2', st.page === 2);
+    var page = (!d.main && !rdrawer && !st.forcePage2) ? 1 : 2;
+    var pageChanged = page !== st.shown;
+    st.page = page;
+    html.classList.toggle('wam-page2', page === 2);
     html.classList.toggle('wam-rdrawer', rdrawer);
-    scrollToPage(d, st.page, instantNext);
+    // The geometry below reads getBoundingClientRect four times, and each read flushes layout, so it only
+    // runs when the page or the width actually changed. Drift (focus, scrollIntoView) already comes through
+    // the scroll listener with instantNext set, and rotation through the resize listener.
+    if (pageChanged || widthChanged || instantNext) {
+      scrollToPage(d, page, instantNext);
+      placeBackButton(d);
+    }
     instantNext = false;
-    placeBackButton(d);
     notifyNative();
+    notifyHost();
   }
 
   var raf = 0, tmo = 0;
@@ -426,7 +482,9 @@
   window.__wam = {
     back: back,
     mode: function () { return mode; },
-    setMode: function (m) { try { localStorage.setItem(MODE_KEY, m === 'desktop' ? 'desktop' : 'mobile'); } catch (e) {} location.reload(); }
+    setMode: function (m) { try { localStorage.setItem(MODE_KEY, m === 'desktop' ? 'desktop' : 'mobile'); } catch (e) {} location.reload(); },
+    turbo: function () { return turbo; },
+    setTurbo: setTurbo
   };
 
   fixViewport();
