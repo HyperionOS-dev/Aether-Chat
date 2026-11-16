@@ -1,17 +1,35 @@
 name: Build IPA
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        # macOS runners are the scarce pool. Different labels are different pools, so when one queue is long
+        # another is worth trying; an unknown label simply never starts, so re-dispatch if it does not appear.
+        description: 'Runner label (macos-15 is known good; try macos-14 / macos-13 / macos-latest when the queue is long)'
+        type: string
+        default: macos-15
+# Manual release builds: keep only the newest. A stack of queued runs holds queue slots and makes everyone wait.
+concurrency:
+  group: build-ipa
+  cancel-in-progress: true
 permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
+    # Only counts once the job starts; it stops a wedged xcodebuild from holding a runner for an hour.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Runner
+        run: |
+          sw_vers
+          xcodebuild -version
       - name: Build unsigned IPA
         run: |
           printf 'APP_DISPLAY_NAME = Aether Chat\nPRODUCT_BUNDLE_IDENTIFIER = com.aether.chat\n' > Local.xcconfig
           xcodebuild -project WhatsAppWeb.xcodeproj -scheme WhatsAppWeb \
-            -configuration Release -sdk iphoneos -derivedDataPath build \
+            -configuration Release -sdk iphoneos -derivedDataPath build -quiet \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
           mkdir Payload
           cp -R build/Build/Products/Release-iphoneos/*.app Payload/
