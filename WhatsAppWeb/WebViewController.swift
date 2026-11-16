@@ -70,6 +70,9 @@ final class WebViewController: UIViewController {
     private let launchImage = UIImageView()
     /// Whether the page has accepted the Turbo setting; retried on the first "layout" message if not.
     private var turboSynced = false
+    /// How many times iOS killed the web process this session (memory pressure). Zero means every reload the
+    /// user saw came from navigation, not from a crash.
+    private var webProcessReloads = 0
 
     override func loadView() {
         let config = WKWebViewConfiguration()
@@ -452,6 +455,7 @@ final class WebViewController: UIViewController {
             "Long tasks over 50 ms: \(body["longTasks"] as? Int ?? 0)",
         ]
         if let mb = Self.memoryFootprintMB() { lines.append(String(format: "Memory: %.0f MB", mb)) }
+        if webProcessReloads > 0 { lines.append("Web process reloads: \(webProcessReloads)") }
         if hangWorstMs > 0 { lines.append("Main thread stalls: up to \(hangWorstMs) ms") }
         if let startup = startupSeconds { lines.append(String(format: "Launch to chat list: %.1f s", startup)) }
         let alert = UIAlertController(title: "Performance", message: lines.joined(separator: "\n"), preferredStyle: .alert)
@@ -531,13 +535,21 @@ final class WebViewController: UIViewController {
     }
 
     /// Only WhatsApp Web itself loads in the web view; any other page would replace the session.
+    /// The scheme is part of the question: a blob: URL carries the host of the page it came from, so
+    /// `blob:https://web.whatsapp.com/…` (a cropped picture, a preview, an export) used to answer "yes"
+    /// here and got loaded into the main frame, wiping the whole client.
     private static func isWebApp(_ url: URL) -> Bool {
-        url.host?.lowercased() == home.host
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+        return url.host?.lowercased() == home.host
     }
 
     /// Opens a link outside the web view. Click-to-chat links (wa.me/<number>, api.whatsapp.com/send)
     /// open the chat in this account instead of the phone's WhatsApp app.
     private func openExternally(_ url: URL) {
+        // blob:, data: and about: exist only inside the page; iOS has nothing to open them with, and a
+        // cropped picture is not a link to hand to Safari.
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme != "blob", scheme != "data", scheme != "about" else { return }
         let host = url.host?.lowercased()
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         let phone = host == "wa.me" ? url.pathComponents.dropFirst().first
@@ -605,13 +617,20 @@ extension WebViewController: WKNavigationDelegate {
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if navigationAction.shouldPerformDownload { return decisionHandler(.download) }
         guard let url = navigationAction.request.url else { return decisionHandler(.allow) }
+        let scheme = url.scheme?.lowercased() ?? ""
         let isSubframe = navigationAction.targetFrame?.isMainFrame == false
-        if isSubframe || Self.isWebApp(url) || ["blob", "data", "about"].contains(url.scheme?.lowercased() ?? "") {
-            decisionHandler(.allow)
-        } else {
-            openExternally(url) // other sites to Safari; tel:, mailto:, maps: to their apps
-            decisionHandler(.cancel)
+        if isSubframe || Self.isWebApp(url) || scheme == "about" {
+            return decisionHandler(.allow)
         }
+        // blob: and data: live inside the page. In a subframe the page's own viewer uses them (allowed
+        // above); in the *main* frame one of them would replace the whole client with a single file — a
+        // cropped picture, an exported document — which is the reload that eats the session. Dropped, and
+        // the page stays exactly where it was.
+        if scheme == "blob" || scheme == "data" {
+            return decisionHandler(.cancel)
+        }
+        openExternally(url) // other sites to Safari; tel:, mailto:, maps: to their apps
+        decisionHandler(.cancel)
     }
 
     func webView(_ webView: WKWebView,
@@ -631,9 +650,11 @@ extension WebViewController: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        // iOS killed the web process (memory pressure); reconnect. In the background, pageReady()
-        // restores the background state once the new page starts.
+        // iOS killed the web process: that is memory pressure, not a navigation — the page is gone and only a
+        // fresh load brings it back. In the background, pageReady() restores the background state afterwards.
+        webProcessReloads += 1
         if UIApplication.shared.applicationState == .background { beginBackgroundTask() }
+        showLaunchSnapshot() // cover the reload with the last frame we have instead of a white screen
         reload()
     }
 }
@@ -645,9 +666,16 @@ extension WebViewController: WKUIDelegate {
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // target=_blank / window.open: WhatsApp Web URLs load here, everything else opens outside.
+        // target=_blank / window.open: WhatsApp Web URLs load here, links to other sites open outside, and
+        // blob:/data:/about: go nowhere at all — they only exist inside the page, and loading one here (a
+        // cropped picture opened in a new window, for example) is what used to replace the whole client.
         if let url = navigationAction.request.url {
-            if Self.isWebApp(url) { webView.load(navigationAction.request) } else { openExternally(url) }
+            let scheme = url.scheme?.lowercased() ?? ""
+            if Self.isWebApp(url) {
+                webView.load(navigationAction.request)
+            } else if scheme == "http" || scheme == "https" {
+                openExternally(url)
+            }
         }
         return nil
     }
